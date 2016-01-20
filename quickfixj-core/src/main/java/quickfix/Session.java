@@ -1377,14 +1377,22 @@ public class Session implements Closeable {
         }
 
         if (validateSequenceNumbers && sequenceReset.isSetField(NewSeqNo.FIELD)) {
-            final int newSequence = sequenceReset.getInt(NewSeqNo.FIELD);
+            int newSequence = sequenceReset.getInt(NewSeqNo.FIELD);
 
             getLog().onEvent(
                     "Received SequenceReset FROM: " + getExpectedTargetNum() + " TO: "
                             + newSequence);
+            
+            final ResendRange range = state.getResendRange();
+            
+            if (range.isChunkedResendRequest() && newSequence > range.getCurrentEndSeqNo()) {
+                int overridenNextSequence = range.getCurrentEndSeqNo() + 1;
+                getLog().onEvent("nextSequenceReset(): new sequence " + newSequence + " is greater than resend chunk range " + range.getCurrentEndSeqNo() + ". Overriding newSequence with chunk end sequence number + 1: " + overridenNextSequence);
+                newSequence = overridenNextSequence;
+            }
+            
             if (newSequence > getExpectedTargetNum()) {
                 state.setNextTargetMsgSeqNum(newSequence);
-                final ResendRange range = state.getResendRange();
                 if (range.isChunkedResendRequest()) {
                     if (newSequence >= range.getCurrentEndSeqNo()
                             && newSequence < range.getEndSeqNo()) {
@@ -1395,7 +1403,7 @@ public class Session implements Closeable {
                         // which would trigger another resend.
                         final String beginString = sequenceReset.getHeader().getString(
                                 BeginString.FIELD);
-                        sendResendRequest(beginString, range.getEndSeqNo() + 1, newSequence + 1,
+                        sendResendRequest(beginString, range.getEndSeqNo() + 1, newSequence,
                                 range.getEndSeqNo());
                     }
                 }
@@ -1667,8 +1675,22 @@ public class Session implements Closeable {
                     }
                 }
                 if (msgSeqNum < range.getEndSeqNo() && range.isChunkedResendRequest() && msgSeqNum >= range.getCurrentEndSeqNo()) {
-                    final String beginString = header.getString(BeginString.FIELD);
-                    sendResendRequest(beginString, range.getEndSeqNo() + 1, msgSeqNum + 1, range.getEndSeqNo());
+                    boolean sequenceResetOutOfChunkRange = false;
+                    
+                    if (msg.getHeader().getString(MsgType.FIELD).equals(MsgType.SEQUENCE_RESET)) {
+                        getLog().onEvent("verify(): veryfying sequence reset: " + msg);
+                        if (msg.getInt(NewSeqNo.FIELD) > range.getCurrentEndSeqNo()) {
+                            getLog().onEvent("verify(): New sequece number " + msg.getInt(NewSeqNo.FIELD) + " is greater than current resend chunk end " + range.getCurrentEndSeqNo() );
+                            sequenceResetOutOfChunkRange = true;
+                        }
+                    }
+                    
+                    if (!sequenceResetOutOfChunkRange) {
+                        final String beginString = header.getString(BeginString.FIELD);
+                        sendResendRequest(beginString, range.getEndSeqNo() + 1, msgSeqNum + 1, range.getEndSeqNo());
+                    } else {
+                        getLog().onEvent("verify(): Not sending resend request on verifying message: " + msg);
+                    }
                 }
             }
         } catch (final FieldNotFound e) {
@@ -1682,7 +1704,7 @@ public class Session implements Closeable {
         fromCallback(msgType, msg, sessionID);
         return true;
     }
-
+    
     private boolean doTargetTooLow(Message msg) throws FieldNotFound, IOException {
         if (!isPossibleDuplicate(msg)) {
             final int msgSeqNum = msg.getHeader().getInt(MsgSeqNum.FIELD);
